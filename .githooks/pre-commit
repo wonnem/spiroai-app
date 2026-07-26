@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Pre-commit secret scanner.
+# Blocks the commit if staged changes look like they contain API keys,
+# tokens, private keys, or other credentials.
+
+set -euo pipefail
+
+staged_files=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$staged_files" ]; then
+  exit 0
+fi
+
+found=0
+
+# --- 1) Filenames that should never be committed, even if .gitignore missed them ---
+filename_pattern='(^|/)(\.env(\..*)?|.*secret.*\.json|.*credentials.*\.json|serviceAccountKey.*\.json|google-services\.json|GoogleService-Info\.plist|firebase-adminsdk-.*\.json|id_rsa(\..*)?|id_ed25519(\..*)?|.*_rsa|.*_dsa|.*\.pem|.*\.key|.*\.p12|.*\.pfx|.*\.jks|.*\.keystore|.*\.ppk)$'
+
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  case "$file" in
+    *.env.example|*.env.sample) continue ;;
+  esac
+  if echo "$file" | grep -Eiq "$filename_pattern"; then
+    echo "BLOCKED: staged file looks like a secret file: $file"
+    found=1
+  fi
+done <<< "$staged_files"
+
+# --- 2) Content patterns inside the actual staged diff (added lines only) ---
+secret_regexes=(
+  'AKIA[0-9A-Z]{16}'                                   # AWS access key ID
+  'aws_secret_access_key'                              # AWS secret key marker
+  'AIza[0-9A-Za-z_-]{35}'                               # Google API key
+  'ghp_[A-Za-z0-9]{36}'                                 # GitHub personal access token
+  'gh[oprsu]_[A-Za-z0-9]{36}'                           # GitHub other tokens
+  'github_pat_[A-Za-z0-9_]{20,}'                        # GitHub fine-grained PAT
+  'sk-ant-[A-Za-z0-9_-]{20,}'                           # Anthropic API key
+  'sk-[A-Za-z0-9]{20,}'                                 # OpenAI-style API key
+  'xox[baprs]-[A-Za-z0-9-]{10,}'                        # Slack token
+  '-----BEGIN [A-Z ]*PRIVATE KEY-----'                  # PEM private key block
+  'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' # JWT
+  '(api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd)["'\'']?\s*[:=]\s*["'\''][A-Za-z0-9/+=_-]{8,}["'\'']'
+)
+
+# Exclude the hook's own scripts/docs: they legitimately contain secret
+# pattern signatures as strings, which would otherwise self-trigger.
+scan_files=$(echo "$staged_files" | grep -v '^\.githooks/' || true)
+
+diff_content=$(git diff --cached -U0 -- $scan_files 2>/dev/null || true)
+added_lines=$(echo "$diff_content" | grep -E '^\+' | grep -Ev '^\+\+\+' || true)
+
+if [ -n "$added_lines" ]; then
+  for pattern in "${secret_regexes[@]}"; do
+    matches=$(echo "$added_lines" | grep -Ei -- "$pattern" || true)
+    if [ -n "$matches" ]; then
+      echo "BLOCKED: possible secret matching pattern [$pattern]:"
+      echo "$matches" | sed 's/^/    /'
+      found=1
+    fi
+  done
+fi
+
+if [ "$found" -ne 0 ]; then
+  echo ""
+  echo "Commit aborted: potential secrets detected in staged changes."
+  echo "Remove the secret, move it to an untracked .env file, and retry."
+  echo "If this is a false positive, you can bypass once with:"
+  echo "    git commit --no-verify"
+  exit 1
+fi
+
+exit 0
